@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import os
 import time
 import math
@@ -116,7 +116,7 @@ class Trainer:
 
         # Mixed precision scaler
         if mixed_precision == "fp16":
-            self.scaler = GradScaler()
+            self.scaler = GradScaler('cuda')
         else:
             self.scaler = None
 
@@ -151,7 +151,7 @@ class Trainer:
 
         # Forward pass with mixed precision
         if self.mixed_precision == "fp16":
-            with autocast():
+            with autocast('cuda', dtype=torch.float16):
                 outputs = self.model(input_ids, labels=labels)
                 loss = outputs["loss"] / self.grad_accumulation_steps
 
@@ -159,7 +159,7 @@ class Trainer:
             self.scaler.scale(loss).backward()
 
         elif self.mixed_precision == "bf16":
-            with autocast(dtype=torch.bfloat16):
+            with autocast('cuda', dtype=torch.bfloat16):
                 outputs = self.model(input_ids, labels=labels)
                 loss = outputs["loss"] / self.grad_accumulation_steps
 
@@ -212,8 +212,11 @@ class Trainer:
             input_ids = batch[:, :-1].to(self.device)
             labels = batch[:, 1:].to(self.device)
 
-            if self.mixed_precision != "no":
-                with autocast():
+            if self.mixed_precision == "fp16":
+                with autocast('cuda', dtype=torch.float16):
+                    outputs = self.model(input_ids, labels=labels)
+            elif self.mixed_precision == "bf16":
+                with autocast('cuda', dtype=torch.bfloat16):
                     outputs = self.model(input_ids, labels=labels)
             else:
                 outputs = self.model(input_ids, labels=labels)

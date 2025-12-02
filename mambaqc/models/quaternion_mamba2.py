@@ -138,14 +138,14 @@ class QuaternionMamba2(nn.Module):
         # === Compute loss if labels provided ===
         loss = None
         if labels is not None:
-            # Shift logits and labels for next-token prediction
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            # Note: shifting is already done in the trainer
+            # input_ids = batch[:, :-1] and labels = batch[:, 1:]
+            # So logits[t] should predict labels[t]
 
             # Flatten for cross-entropy
             loss = nn.functional.cross_entropy(
-                shift_logits.view(-1, self.vocab_size),
-                shift_labels.view(-1),
+                logits.view(-1, self.vocab_size),
+                labels.view(-1),
                 ignore_index=-100,  # Standard ignore index
             )
 
