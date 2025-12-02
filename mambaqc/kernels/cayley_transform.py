@@ -18,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .quaternion_ops import _can_use_triton
+
 
 @triton.jit
 def cayley_discretization_kernel(
@@ -148,6 +150,9 @@ def cayley_discretization_fused(z: torch.Tensor, eps: float = 1e-6) -> torch.Ten
     """
     assert z.shape[-1] == 4, f"Last dim must be 4, got {z.shape[-1]}"
     assert z.ndim == 5, f"Expected 5D tensor, got {z.ndim}D"
+
+    if not _can_use_triton(z):
+        return cayley_discretization_reference(z, eps=eps)
 
     batch_size, seq_len, d_model, d_state, _ = z.shape
     original_shape = z.shape
