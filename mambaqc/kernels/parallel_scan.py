@@ -186,6 +186,9 @@ def parallel_scan_quaternion(q_sequence: torch.Tensor) -> torch.Tensor:
     assert q_sequence.shape[-1] == 4
     assert q_sequence.ndim == 5
 
+    if not (q_sequence.is_cuda and torch.cuda.is_available()):
+        return parallel_scan_quaternion_reference(q_sequence)
+
     batch_size, seq_len, d_model, d_state, _ = q_sequence.shape
     original_shape = q_sequence.shape
 
