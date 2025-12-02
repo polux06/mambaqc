@@ -13,6 +13,11 @@ import triton
 import triton.language as tl
 
 
+def _can_use_triton(tensor: torch.Tensor) -> bool:
+    """Return True when Triton kernels can run for the given tensor."""
+    return tensor.is_cuda and torch.cuda.is_available()
+
+
 @triton.jit
 def quaternion_multiply_kernel(
     # Pointers
@@ -265,6 +270,17 @@ def quaternion_multiply(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     assert p.shape == q.shape, f"Shape mismatch: {p.shape} vs {q.shape}"
     assert p.shape[-1] == 4, f"Last dim must be 4, got {p.shape[-1]}"
 
+    if not _can_use_triton(p):
+        p0, p1, p2, p3 = p.unbind(-1)
+        q0, q1, q2, q3 = q.unbind(-1)
+
+        r0 = p0 * q0 - p1 * q1 - p2 * q2 - p3 * q3
+        r1 = p0 * q1 + p1 * q0 + p2 * q3 - p3 * q2
+        r2 = p0 * q2 - p1 * q3 + p2 * q0 + p3 * q1
+        r3 = p0 * q3 + p1 * q2 - p2 * q1 + p3 * q0
+
+        return torch.stack((r0, r1, r2, r3), dim=-1)
+
     # Flatten to 2D for kernel
     original_shape = p.shape
     p_flat = p.reshape(-1, 4)
@@ -303,6 +319,9 @@ def quaternion_multiply_batched(p: torch.Tensor, q: torch.Tensor) -> torch.Tenso
     assert p.ndim == 5, f"Expected 5D tensor, got {p.ndim}D"
 
     batch_size, seq_len, d_model, d_state, _ = p.shape
+
+    if not _can_use_triton(p):
+        return quaternion_multiply(p, q)
 
     # Allocate output
     out = torch.empty_like(p)
@@ -350,6 +369,10 @@ def quaternion_conjugate(q: torch.Tensor) -> torch.Tensor:
     """
     assert q.shape[-1] == 4
 
+    if not _can_use_triton(q):
+        signs = torch.tensor([1.0, -1.0, -1.0, -1.0], device=q.device, dtype=q.dtype)
+        return q * signs
+
     original_shape = q.shape
     q_flat = q.reshape(-1, 4)
     n_elements = q_flat.shape[0]
@@ -381,6 +404,11 @@ def quaternion_inverse(q: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """
     assert q.shape[-1] == 4
 
+    if not _can_use_triton(q):
+        conj = quaternion_conjugate(q)
+        norm_sq = (q * q).sum(dim=-1, keepdim=True).clamp_min(eps)
+        return conj / norm_sq
+
     original_shape = q.shape
     q_flat = q.reshape(-1, 4)
     n_elements = q_flat.shape[0]
@@ -411,6 +439,9 @@ def quaternion_norm(q: torch.Tensor) -> torch.Tensor:
         norm: [...] norm tensor (scalar per quaternion)
     """
     assert q.shape[-1] == 4
+
+    if not _can_use_triton(q):
+        return torch.linalg.vector_norm(q, dim=-1)
 
     original_shape = q.shape[:-1]
     q_flat = q.reshape(-1, 4)
