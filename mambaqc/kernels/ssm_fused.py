@@ -130,11 +130,11 @@ def ssm_step_kernel(
         B3 = tl.load(B_ptr + B_base + 3, mask=mask_full, other=0.0)
 
         # Compute B * S (input injection)
-        # Expand S to (B, D, 1) which broadcasts with (B, D, K)
-        s0 = S0[:, :, None]
-        s1 = S1[:, :, None]
-        s2 = S2[:, :, None]
-        s3 = S3[:, :, None]
+        # Broadcast S across k dimension explicitly to match (B, D, K)
+        s0 = tl.broadcast_to(S0[:, :, None], mask_full.shape)
+        s1 = tl.broadcast_to(S1[:, :, None], mask_full.shape)
+        s2 = tl.broadcast_to(S2[:, :, None], mask_full.shape)
+        s3 = tl.broadcast_to(S3[:, :, None], mask_full.shape)
 
         BS0 = B0*s0 - B1*s1 - B2*s2 - B3*s3
         BS1 = B0*s1 + B1*s0 + B2*s3 - B3*s2
