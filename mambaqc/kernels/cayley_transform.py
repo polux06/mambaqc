@@ -22,64 +22,59 @@ import triton.language as tl
 @triton.jit
 def cayley_discretization_kernel(
     # Inputs
-    z_ptr,  # [batch, seq_len, d_model, d_state, 4] - dynamics
+    z_ptr,  # [batch*seq_len, d_model, d_state, 4] - dynamics (flattened)
     # Outputs
-    q_ptr,  # [batch, seq_len, d_model, d_state, 4] - discrete operators
+    q_ptr,  # [batch*seq_len, d_model, d_state, 4] - discrete operators (flattened)
     # Shapes
-    batch_size, seq_len, d_model, d_state,
+    n_batch_seq, d_model, d_state,
     # Strides
-    stride_zb, stride_zs, stride_zd, stride_zk,
-    stride_qb, stride_qs, stride_qd, stride_qk,
+    stride_zbs, stride_zd, stride_zk,
+    stride_qbs, stride_qd, stride_qk,
     # Constants
     eps: tl.constexpr,
     # Tiling
-    BLOCK_B: tl.constexpr,
-    BLOCK_S: tl.constexpr,
+    BLOCK_BS: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     """
-    Fused Cayley transform kernel.
+    Fused Cayley transform kernel (3D grid).
 
     Computes: q = (1 - 0.5*z)^{-1} * (1 + 0.5*z)
 
     All intermediate results stay in registers (no HBM roundtrip).
+
+    Grid: (batch*seq_len, d_model, d_state)
     """
-    pid_b = tl.program_id(0)
-    pid_s = tl.program_id(1)
-    pid_d = tl.program_id(2)
-    pid_k = tl.program_id(3)
+    pid_bs = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    pid_k = tl.program_id(2)
 
     # Compute offsets
-    b_offsets = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
-    s_offsets = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    bs_offsets = pid_bs * BLOCK_BS + tl.arange(0, BLOCK_BS)
     d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     k_offsets = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
 
     # Masks
-    b_mask = b_offsets < batch_size
-    s_mask = s_offsets < seq_len
+    bs_mask = bs_offsets < n_batch_seq
     d_mask = d_offsets < d_model
     k_mask = k_offsets < d_state
 
-    # Broadcast for 4D indexing
-    b_idx = b_offsets[:, None, None, None]
-    s_idx = s_offsets[None, :, None, None]
-    d_idx = d_offsets[None, None, :, None]
-    k_idx = k_offsets[None, None, None, :]
+    # Broadcast for 3D indexing
+    bs_idx = bs_offsets[:, None, None]
+    d_idx = d_offsets[None, :, None]
+    k_idx = k_offsets[None, None, :]
 
     # Compute base pointer for z
-    z_base = (b_idx * stride_zb + s_idx * stride_zs +
-              d_idx * stride_zd + k_idx * stride_zk)
+    z_base = (bs_idx * stride_zbs + d_idx * stride_zd + k_idx * stride_zk)
 
     # Load z components
-    mask_4d = (b_mask[:, None, None, None] & s_mask[None, :, None, None] &
-               d_mask[None, None, :, None] & k_mask[None, None, None, :])
+    mask_3d = bs_mask[:, None, None] & d_mask[None, :, None] & k_mask[None, None, :]
 
-    z0 = tl.load(z_ptr + z_base + 0, mask=mask_4d, other=0.0)
-    z1 = tl.load(z_ptr + z_base + 1, mask=mask_4d, other=0.0)
-    z2 = tl.load(z_ptr + z_base + 2, mask=mask_4d, other=0.0)
-    z3 = tl.load(z_ptr + z_base + 3, mask=mask_4d, other=0.0)
+    z0 = tl.load(z_ptr + z_base + 0, mask=mask_3d, other=0.0)
+    z1 = tl.load(z_ptr + z_base + 1, mask=mask_3d, other=0.0)
+    z2 = tl.load(z_ptr + z_base + 2, mask=mask_3d, other=0.0)
+    z3 = tl.load(z_ptr + z_base + 3, mask=mask_3d, other=0.0)
 
     # Identity quaternion: (1, 0, 0, 0)
     one_0 = 1.0
@@ -124,13 +119,12 @@ def cayley_discretization_kernel(
     q3 = den_inv_0*num_3 + den_inv_1*num_2 - den_inv_2*num_1 + den_inv_3*num_0
 
     # Store results (4 coalesced stores)
-    q_base = (b_idx * stride_qb + s_idx * stride_qs +
-              d_idx * stride_qd + k_idx * stride_qk)
+    q_base = (bs_idx * stride_qbs + d_idx * stride_qd + k_idx * stride_qk)
 
-    tl.store(q_ptr + q_base + 0, q0, mask=mask_4d)
-    tl.store(q_ptr + q_base + 1, q1, mask=mask_4d)
-    tl.store(q_ptr + q_base + 2, q2, mask=mask_4d)
-    tl.store(q_ptr + q_base + 3, q3, mask=mask_4d)
+    tl.store(q_ptr + q_base + 0, q0, mask=mask_3d)
+    tl.store(q_ptr + q_base + 1, q1, mask=mask_3d)
+    tl.store(q_ptr + q_base + 2, q2, mask=mask_3d)
+    tl.store(q_ptr + q_base + 3, q3, mask=mask_3d)
 
 
 def cayley_discretization_fused(z: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -156,36 +150,42 @@ def cayley_discretization_fused(z: torch.Tensor, eps: float = 1e-6) -> torch.Ten
     assert z.ndim == 5, f"Expected 5D tensor, got {z.ndim}D"
 
     batch_size, seq_len, d_model, d_state, _ = z.shape
+    original_shape = z.shape
 
-    # Allocate output
-    q = torch.empty_like(z)
+    # Flatten batch and seq_len for 3D grid
+    z_flat = z.reshape(batch_size * seq_len, d_model, d_state, 4)
+    n_batch_seq = batch_size * seq_len
 
-    # Compute strides
-    stride_zb, stride_zs, stride_zd, stride_zk, _ = z.stride()
-    stride_qb, stride_qs, stride_qd, stride_qk, _ = q.stride()
+    # Allocate output (flattened)
+    q_flat = torch.empty_like(z_flat)
+
+    # Compute strides (for flattened tensors)
+    stride_zbs, stride_zd, stride_zk, _ = z_flat.stride()
+    stride_qbs, stride_qd, stride_qk, _ = q_flat.stride()
 
     # Tiling configuration (tune for your GPU)
-    BLOCK_B, BLOCK_S, BLOCK_D, BLOCK_K = 1, 4, 16, 8
+    BLOCK_BS, BLOCK_D, BLOCK_K = 4, 16, 8
 
-    # Grid dimensions
+    # Grid dimensions (3D only)
     grid = (
-        triton.cdiv(batch_size, BLOCK_B),
-        triton.cdiv(seq_len, BLOCK_S),
+        triton.cdiv(n_batch_seq, BLOCK_BS),
         triton.cdiv(d_model, BLOCK_D),
         triton.cdiv(d_state, BLOCK_K),
     )
 
     cayley_discretization_kernel[grid](
-        z, q,
-        batch_size, seq_len, d_model, d_state,
-        stride_zb, stride_zs, stride_zd, stride_zk,
-        stride_qb, stride_qs, stride_qd, stride_qk,
+        z_flat, q_flat,
+        n_batch_seq, d_model, d_state,
+        stride_zbs, stride_zd, stride_zk,
+        stride_qbs, stride_qd, stride_qk,
         eps=eps,
-        BLOCK_B=BLOCK_B,
-        BLOCK_S=BLOCK_S,
+        BLOCK_BS=BLOCK_BS,
         BLOCK_D=BLOCK_D,
         BLOCK_K=BLOCK_K,
     )
+
+    # Reshape back to original shape
+    q = q_flat.reshape(original_shape)
 
     return q
 
