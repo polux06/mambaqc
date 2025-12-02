@@ -112,7 +112,113 @@ def quat_inv_backward(q: torch.Tensor, gy: torch.Tensor, eps: float = 1e-6):
 
 
 # =============================================================================
-# 3. SSM QUATERNIONIQUE AVEC BACKWARD ANALYTIQUE
+# 3. SCAN PARALLÈLE / SÉQUENTIEL POUR SSM QUATERNIONIQUE
+# =============================================================================
+
+def parallel_quaternion_scan(dA: torch.Tensor, Bu: torch.Tensor) -> torch.Tensor:
+    """
+    Calcule h_t = dA_t h_{t-1} + Bu_t via un scan parallèle (style Blelloch).
+
+    Args:
+        dA: (B, L, D_q, S_q, 4)
+        Bu: (B, L, D_q, S_q, 4)
+
+    Returns:
+        h: (B, L, D_q, S_q, 4)
+    """
+    B_sz, L_val, Dq, Sq, _ = dA.shape
+    total = 1 << (L_val - 1).bit_length()
+
+    A_pad = torch.zeros(B_sz, total, Dq, Sq, 4, device=dA.device, dtype=dA.dtype)
+    A_pad[..., 0] = 1.0
+    B_pad = torch.zeros_like(A_pad)
+
+    A_pad[:, :L_val] = dA
+    B_pad[:, :L_val] = Bu
+
+    step = 1
+    while step < total:
+        A_left = A_pad[:, :-step]
+        B_left = B_pad[:, :-step]
+        A_right = A_pad[:, step:]
+        B_right = B_pad[:, step:]
+
+        new_A = quat_mul(A_right, A_left)
+        new_B = B_right + quat_mul(A_right, B_left)
+
+        A_pad[:, step:] = new_A
+        B_pad[:, step:] = new_B
+        step <<= 1
+
+    return B_pad[:, :L_val]
+
+
+def sequential_quaternion_scan(dA: torch.Tensor, Bu: torch.Tensor) -> torch.Tensor:
+    """Référence séquentielle pour h_t = dA_t h_{t-1} + Bu_t."""
+    h = torch.zeros(dA.shape[0], dA.shape[2], dA.shape[3], 4, device=dA.device, dtype=dA.dtype)
+    outs = []
+    for t in range(dA.shape[1]):
+        h = quat_mul(dA[:, t], h) + Bu[:, t]
+        outs.append(h)
+    return torch.stack(outs, dim=1)
+
+
+def sequential_quaternion_ssm_autograd(
+    u: torch.Tensor, dt: torch.Tensor, A_quat: torch.Tensor, B_quat: torch.Tensor, C_quat: torch.Tensor
+) -> torch.Tensor:
+    """
+    Référence entièrement autograd pour vérifier le backward analytique.
+
+    Args:
+        u: (B, L, D_q, 4)
+        dt: (B, L, D_q)
+        A_quat: (1, 1, D_q, S_q, 4)
+        B_quat: (B, L, S_q, 4)
+        C_quat: (B, L, S_q, 4)
+
+    Returns:
+        y: (B, L, D_q, 4)
+    """
+    B_sz, L, D_q, _ = u.shape
+    S_q = A_quat.shape[3]
+
+    A_core = A_quat.view(D_q, S_q, 4)
+    ones = torch.zeros(D_q, S_q, 4, device=u.device, dtype=u.dtype)
+    ones[..., 0] = 1.0
+
+    dt_broad = dt.unsqueeze(-1).unsqueeze(-1)  # (B, L, D_q, 1, 1)
+    half_dt = 0.5 * dt_broad
+
+    A_scaled = A_core.unsqueeze(0).unsqueeze(0) * half_dt
+    ones_b = ones.unsqueeze(0).unsqueeze(0)
+
+    num = ones_b + A_scaled
+    den = ones_b - A_scaled
+    den_inv = quat_inv(den)
+
+    dA = quat_mul(num, den_inv)
+    dB_scale = den_inv * dt_broad
+
+    B_unsq = B_quat.unsqueeze(2)
+    dB = quat_mul(dB_scale, B_unsq)
+
+    u_unsq = u.unsqueeze(3)
+    Bu = quat_mul(dB, u_unsq)
+
+    h = torch.zeros(B_sz, D_q, S_q, 4, device=u.device, dtype=u.dtype)
+    outs = []
+    for t in range(L):
+        h = quat_mul(dA[:, t], h) + Bu[:, t]
+        outs.append(h)
+    h_all = torch.stack(outs, dim=1)
+
+    C_unsq = C_quat.unsqueeze(2)
+    yh = quat_mul(C_unsq, h_all)
+    return yh.sum(dim=3)
+
+
+# =============================================================================
+# 4. SSM QUATERNIONIQUE AVEC BACKWARD ANALYTIQUE
 # =============================================================================
 
 class QuaternionSSMFunction(torch.autograd.Function):
@@ -140,48 +246,37 @@ class QuaternionSSMFunction(torch.autograd.Function):
         ones = torch.zeros(D_q, S_q, 4, device=device, dtype=dtype)
         ones[..., 0] = 1.0
 
-        # État initial
-        h = torch.zeros(B_sz, D_q, S_q, 4, device=device, dtype=dtype)
-        ys = []
-        h_list = []
-
-        # Forward SSM sans autograd (sous no_grad)
         with torch.no_grad():
-            for t in range(L):
-                dt_t = dt[:, t]         # (B, D_q)
-                B_t = B_quat[:, t]      # (B, S_q, 4)
-                C_t = C_quat[:, t]      # (B, S_q, 4)
-                u_t = u[:, t]           # (B, D_q, 4)
+            dt_broad = dt.unsqueeze(-1).unsqueeze(-1)         # (B, L, D_q, 1, 1)
+            half_dt = 0.5 * dt_broad                         # (B, L, D_q, 1, 1)
 
-                dt_broad = dt_t.unsqueeze(-1).unsqueeze(-1)   # (B, D_q, 1, 1)
-                half_dt = 0.5 * dt_broad                      # (B, D_q, 1, 1)
+            A_scaled = A_core.unsqueeze(0).unsqueeze(0) * half_dt  # (B, L, D_q, S_q, 4)
+            ones_b = ones.unsqueeze(0).unsqueeze(0)               # (1, 1, D_q, S_q, 4)
 
-                A_scaled = A_core.unsqueeze(0) * half_dt      # (B, D_q, S_q, 4)
-                ones_b = ones.unsqueeze(0)                    # (1, D_q, S_q, 4)
+            num = ones_b + A_scaled
+            den = ones_b - A_scaled
+            den_inv = quat_inv(den)
 
-                num = ones_b + A_scaled                       # (B, D_q, S_q, 4)
-                den = ones_b - A_scaled                       # (B, D_q, S_q, 4)
-                den_inv = quat_inv(den)                       # (B, D_q, S_q, 4)
+            dA = quat_mul(num, den_inv)                          # (B, L, D_q, S_q, 4)
+            dB_scale = den_inv * dt_broad                        # (B, L, D_q, S_q, 4)
 
-                dA = quat_mul(num, den_inv)                   # (B, D_q, S_q, 4)
-                dB_scale = den_inv * dt_broad                 # (B, D_q, S_q, 4)
+            B_unsq = B_quat.unsqueeze(2)                         # (B, L, 1, S_q, 4)
+            dB = quat_mul(dB_scale, B_unsq)                      # (B, L, D_q, S_q, 4)
 
-                B_unsq = B_t.unsqueeze(1)                     # (B, 1, S_q, 4) -> broadcast sur D_q
-                dB = quat_mul(dB_scale, B_unsq)               # (B, D_q, S_q, 4)
+            u_unsq = u.unsqueeze(3)                              # (B, L, D_q, 1, 4)
+            Bu = quat_mul(dB, u_unsq)                            # (B, L, D_q, S_q, 4)
 
-                u_unsq = u_t.unsqueeze(2)                     # (B, D_q, 1, 4) -> broadcast sur S_q
-                Bu = quat_mul(dB, u_unsq)                     # (B, D_q, S_q, 4)
+            h_all = parallel_quaternion_scan(dA, Bu)             # (B, L, D_q, S_q, 4)
 
-                Ah = quat_mul(dA, h)                          # (B, D_q, S_q, 4)
-                h = Ah + Bu                                   # (B, D_q, S_q, 4)
+            # Recompute a sequential state trajectory for the backward pass
+            # to ensure the stored history exactly follows the recurrence,
+            # independently of the parallel scan implementation.
+            h_seq_all = sequential_quaternion_scan(dA, Bu)
+            h_list = [h_seq_all[:, t].clone() for t in range(L)]
 
-                h_list.append(h.clone())
-
-                C_unsq = C_t.unsqueeze(1)                     # (B, 1, S_q, 4) -> broadcast sur D_q
-                yh = quat_mul(C_unsq, h)                      # (B, D_q, S_q, 4)
-                ys.append(yh.sum(dim=2))                      # (B, D_q, 4)
-
-        y = torch.stack(ys, dim=1)                            # (B, L, D_q, 4)
+            C_unsq = C_quat.unsqueeze(2)                         # (B, L, 1, S_q, 4)
+            yh = quat_mul(C_unsq, h_all)                         # (B, L, D_q, S_q, 4)
+            y = yh.sum(dim=3)                                    # (B, L, D_q, 4)
 
         # On sauvegarde uniquement les inputs + quelques structures
         ctx.save_for_backward(u, dt, A_quat, B_quat, C_quat)
@@ -559,9 +654,61 @@ class QuaternionMambaLMHeadModel(nn.Module):
 
 
 if __name__ == "__main__":
-    # Petit test de sanité
+    # Tests rapides : scan parallèle vs séquentiel + passe avant du modèle
+    torch.manual_seed(0)
+
+    B, L, D_q, S_q = 2, 5, 3, 2
+    dA = torch.randn(B, L, D_q, S_q, 4)
+    Bu = torch.randn(B, L, D_q, S_q, 4)
+
+    h_parallel = parallel_quaternion_scan(dA, Bu)
+    h_seq = sequential_quaternion_scan(dA, Bu)
+    torch.testing.assert_close(h_parallel, h_seq, rtol=1e-5, atol=1e-5)
+    print("[OK] Scan parallèle équivaut au scan séquentiel sur un exemple synthétique.")
+
     cfg = QuaternionMambaConfig(d_model=64, n_layers=2, vocab_size=100, d_state=16, expand=2)
     model = QuaternionMambaLMHeadModel(cfg)
     x = torch.randint(0, 100, (2, 32))
     logits, loss = model(x, targets=x)
-    print(f"Output: {logits.shape}, Loss: {loss}")
+    print(f"[OK] Passe avant du modèle : logits {logits.shape}, loss {loss.item():.4f}")
+
+    # Vérification du backward : comparaison analytique vs autograd naïf
+    torch.manual_seed(1)
+    B, L, D_q, S_q = 1, 3, 2, 2
+    dtype = torch.double
+
+    def rand_quat(shape, scale=0.1):
+        return (torch.randn(*shape, dtype=dtype) * scale).requires_grad_()
+
+    u = (torch.randn(B, L, D_q, 4, dtype=dtype) * 0.2).requires_grad_()
+    dt = (torch.rand(B, L, D_q, dtype=dtype) * 0.1 + 0.05).requires_grad_()
+    A_quat = rand_quat((1, 1, D_q, S_q, 4), scale=0.05)
+    B_quat = rand_quat((B, L, S_q, 4), scale=0.1)
+    C_quat = rand_quat((B, L, S_q, 4), scale=0.1)
+
+    # Custom autograd
+    y_custom = quaternion_ssm(u, dt, A_quat, B_quat, C_quat)
+    loss_custom = (y_custom ** 2).sum()
+    grads_custom = torch.autograd.grad(loss_custom, [u, dt, A_quat, B_quat, C_quat], create_graph=False)
+
+    # Référence autograd séquentielle
+    u_ref, dt_ref, A_ref, B_ref, C_ref = [t.detach().clone().requires_grad_() for t in (u, dt, A_quat, B_quat, C_quat)]
+    y_ref = sequential_quaternion_ssm_autograd(u_ref, dt_ref, A_ref, B_ref, C_ref)
+    loss_ref = (y_ref ** 2).sum()
+    grads_ref = torch.autograd.grad(loss_ref, [u_ref, dt_ref, A_ref, B_ref, C_ref], create_graph=False)
+
+    for name, g_c, g_r in zip(["u", "dt", "A", "B", "C"], grads_custom, grads_ref):
+        torch.testing.assert_close(g_c, g_r, rtol=1e-5, atol=1e-6)
+    print("[OK] Backward analytique concorde avec autograd séquentiel.")
+
+    # Gradcheck complet sur un cas minuscule pour valider le backward analytique
+    torch.autograd.gradcheck(
+        lambda *inp: quaternion_ssm(*inp),
+        (u.detach().double().requires_grad_(), dt.detach().double().requires_grad_(),
+         A_quat.detach().double().requires_grad_(), B_quat.detach().double().requires_grad_(),
+         C_quat.detach().double().requires_grad_()),
+        eps=1e-6,
+        atol=1e-4,
+        rtol=1e-3,
+    )
+    print("[OK] gradcheck torch sur quaternion_ssm passé.")
