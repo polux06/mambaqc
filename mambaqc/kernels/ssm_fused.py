@@ -24,6 +24,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .quaternion_ops import _can_use_triton
+
 
 @triton.jit
 def ssm_step_kernel(
@@ -278,6 +280,9 @@ def ssm_step_fused(
         h_new = q * h_prev + B * S
         y = sum_k(C[:, :, k] * h_new[:, :, k]) + D * S
     """
+    if not _can_use_triton(q):
+        return ssm_step_reference(q, B, S, C, D, h_prev)
+
     batch_size, d_model, d_state, _ = q.shape
 
     assert B.shape == (batch_size, d_model, d_state, 4)
@@ -349,6 +354,24 @@ def ssm_forward_fused(
     Note: This loops over timesteps in Python. For maximum efficiency,
     could implement a mega-kernel, but that's complex and less flexible.
     """
+    if not _can_use_triton(q):
+        batch_size, seq_len, d_model, d_state, _ = q.shape
+        h = torch.zeros(batch_size, d_model, d_state, 4, device=q.device, dtype=q.dtype)
+        y_all = torch.empty(batch_size, seq_len, d_model, 4, device=q.device, dtype=q.dtype)
+
+        for t in range(seq_len):
+            h, y_t = ssm_step_reference(
+                q[:, t],
+                B[:, t],
+                S[:, t],
+                C[:, t],
+                D[:, t],
+                h,
+            )
+            y_all[:, t] = y_t
+
+        return y_all
+
     batch_size, seq_len, d_model, d_state, _ = q.shape
 
     # Initialize state
