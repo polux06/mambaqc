@@ -130,16 +130,16 @@ def ssm_step_kernel(
         B3 = tl.load(B_ptr + B_base + 3, mask=mask_full, other=0.0)
 
         # Compute B * S (input injection)
-        # Broadcast S across k dimension
-        S0_bcast = S0[:, :, None]
-        S1_bcast = S1[:, :, None]
-        S2_bcast = S2[:, :, None]
-        S3_bcast = S3[:, :, None]
+        # Broadcast S across k dimension explicitly to match (B, D, K)
+        s0 = tl.broadcast_to(S0[:, :, None], mask_full.shape)
+        s1 = tl.broadcast_to(S1[:, :, None], mask_full.shape)
+        s2 = tl.broadcast_to(S2[:, :, None], mask_full.shape)
+        s3 = tl.broadcast_to(S3[:, :, None], mask_full.shape)
 
-        BS0 = B0*S0_bcast - B1*S1_bcast - B2*S2_bcast - B3*S3_bcast
-        BS1 = B0*S1_bcast + B1*S0_bcast + B2*S3_bcast - B3*S2_bcast
-        BS2 = B0*S2_bcast - B1*S3_bcast + B2*S0_bcast + B3*S1_bcast
-        BS3 = B0*S3_bcast + B1*S2_bcast - B2*S1_bcast + B3*S0_bcast
+        BS0 = B0*s0 - B1*s1 - B2*s2 - B3*s3
+        BS1 = B0*s1 + B1*s0 + B2*s3 - B3*s2
+        BS2 = B0*s2 - B1*s3 + B2*s0 + B3*s1
+        BS3 = B0*s3 + B1*s2 - B2*s1 + B3*s0
 
         # Update state: h_new = q*h_prev + B*S
         hn0 = qh0 + BS0
