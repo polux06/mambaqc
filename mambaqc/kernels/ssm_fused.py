@@ -24,6 +24,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .quaternion_ops import _can_use_triton
+
 
 @triton.jit
 def ssm_step_kernel(
@@ -84,7 +86,9 @@ def ssm_step_kernel(
     y3_acc = tl.zeros((BLOCK_B, BLOCK_D), dtype=tl.float32)
 
     # Load S (selected signal) - shared across all k
-    S_base = b_idx[:, :, 0] * stride_Sb + d_idx[:, :, 0] * stride_Sd
+    b_idx_2d = b_offsets[:, None]
+    d_idx_2d = d_offsets[None, :]
+    S_base = b_idx_2d[:, :, None] * stride_Sb + d_idx_2d[:, :, None] * stride_Sd
     mask_2d = b_mask[:, None] & d_mask[None, :]
 
     S0 = tl.load(S_ptr + S_base + 0, mask=mask_2d, other=0.0)
@@ -170,7 +174,7 @@ def ssm_step_kernel(
         y3_acc += tl.sum(Ch3, axis=2)
 
     # Add skip connection: y += D * S
-    D_base = b_idx[:, :, 0] * stride_Db + d_idx[:, :, 0]
+    D_base = b_idx_2d * stride_Db + d_idx_2d
     D_val = tl.load(D_ptr + D_base, mask=mask_2d, other=0.0)
 
     y0_acc += D_val * S0
@@ -179,7 +183,7 @@ def ssm_step_kernel(
     y3_acc += D_val * S3
 
     # Store output y[b, d, :]
-    y_base = b_idx[:, :, 0] * stride_yb + d_idx[:, :, 0] * stride_yd
+    y_base = b_idx_2d * stride_yb + d_idx_2d * stride_yd
     tl.store(y_ptr + y_base + 0, y0_acc, mask=mask_2d)
     tl.store(y_ptr + y_base + 1, y1_acc, mask=mask_2d)
     tl.store(y_ptr + y_base + 2, y2_acc, mask=mask_2d)
@@ -278,6 +282,9 @@ def ssm_step_fused(
         h_new = q * h_prev + B * S
         y = sum_k(C[:, :, k] * h_new[:, :, k]) + D * S
     """
+    if not _can_use_triton(q):
+        return ssm_step_reference(q, B, S, C, D, h_prev)
+
     batch_size, d_model, d_state, _ = q.shape
 
     assert B.shape == (batch_size, d_model, d_state, 4)
@@ -349,6 +356,24 @@ def ssm_forward_fused(
     Note: This loops over timesteps in Python. For maximum efficiency,
     could implement a mega-kernel, but that's complex and less flexible.
     """
+    if not _can_use_triton(q):
+        batch_size, seq_len, d_model, d_state, _ = q.shape
+        h = torch.zeros(batch_size, d_model, d_state, 4, device=q.device, dtype=q.dtype)
+        y_all = torch.empty(batch_size, seq_len, d_model, 4, device=q.device, dtype=q.dtype)
+
+        for t in range(seq_len):
+            h, y_t = ssm_step_reference(
+                q[:, t],
+                B[:, t],
+                S[:, t],
+                C[:, t],
+                D[:, t],
+                h,
+            )
+            y_all[:, t] = y_t
+
+        return y_all
+
     batch_size, seq_len, d_model, d_state, _ = q.shape
 
     # Initialize state
