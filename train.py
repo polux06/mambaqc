@@ -328,8 +328,8 @@ def main():
     # Configuration
     config = {
         "vocab_size": 10000,
-        "d_model": 768,
-        "n_layers": 12,
+        "d_model": 256,
+        "n_layers": 6,
         "d_state": 64,
         "batch_size": 4,
         "learning_rate": 3e-4,
