@@ -30,10 +30,17 @@ class TinyStoriesDataset(Dataset):
     TODO: Replace with actual dataset loading.
     """
 
-    def __init__(self, data_path: str, seq_len: int = 2048):
+    def __init__(self, data_path: str, vocab_size: int, seq_len: int = 2048, n_samples: int = 1000):
         self.seq_len = seq_len
-        # Placeholder: load your data here
-        self.data = torch.randint(0, 10000, (1000, seq_len))
+        self.vocab_size = vocab_size
+
+        # Placeholder: generate random valid tokens
+        # IMPORTANT: tokens must be in range [0, vocab_size-1]
+        self.data = torch.randint(0, vocab_size, (n_samples, seq_len + 1))
+
+        # Verify all tokens are valid
+        assert self.data.min() >= 0, f"Invalid negative token: {self.data.min()}"
+        assert self.data.max() < vocab_size, f"Token {self.data.max()} >= vocab_size {vocab_size}"
 
     def __len__(self):
         return len(self.data)
@@ -351,8 +358,18 @@ def main():
 
     # Create datasets (placeholder)
     print("Loading datasets...")
-    train_dataset = TinyStoriesDataset("train.txt", seq_len=2048)
-    val_dataset = TinyStoriesDataset("val.txt", seq_len=2048)
+    train_dataset = TinyStoriesDataset(
+        "train.txt",
+        vocab_size=config["vocab_size"],
+        seq_len=2048,
+        n_samples=1000
+    )
+    val_dataset = TinyStoriesDataset(
+        "val.txt",
+        vocab_size=config["vocab_size"],
+        seq_len=2048,
+        n_samples=100
+    )
 
     # Create trainer
     trainer = Trainer(
