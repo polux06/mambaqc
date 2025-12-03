@@ -118,6 +118,11 @@ class QuaternionMamba2(nn.Module):
         """
         batch_size, seq_len = input_ids.shape
 
+        # Verify input tokens are valid
+        assert input_ids.min() >= 0, f"Negative token index: {input_ids.min().item()}"
+        assert input_ids.max() < self.vocab_size, \
+            f"Token index {input_ids.max().item()} >= vocab_size {self.vocab_size}"
+
         # === Embedding ===
         x = self.embedding(input_ids)  # [B, T, d_model]
         x = self.dropout(x)
@@ -141,6 +146,13 @@ class QuaternionMamba2(nn.Module):
             # Note: shifting is already done in the trainer
             # input_ids = batch[:, :-1] and labels = batch[:, 1:]
             # So logits[t] should predict labels[t]
+
+            # Verify labels are valid (excluding ignore_index)
+            valid_labels = labels[labels != -100]
+            if len(valid_labels) > 0:
+                assert valid_labels.min() >= 0, f"Negative label: {valid_labels.min().item()}"
+                assert valid_labels.max() < self.vocab_size, \
+                    f"Label {valid_labels.max().item()} >= vocab_size {self.vocab_size}"
 
             # Flatten for cross-entropy
             loss = nn.functional.cross_entropy(
