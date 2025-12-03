@@ -88,8 +88,7 @@ def ssm_step_kernel(
     # Load S (selected signal) - shared across all k
     b_idx_2d = b_offsets[:, None]
     d_idx_2d = d_offsets[None, :]
-    # Keep S indexing 2D so the loaded tensors are rank-2 and expand to K cleanly
-    S_base = b_idx_2d * stride_Sb + d_idx_2d * stride_Sd
+    S_base = b_idx_2d[:, :, None] * stride_Sb + d_idx_2d[:, :, None] * stride_Sd
     mask_2d = b_mask[:, None] & d_mask[None, :]
 
     S0 = tl.load(S_ptr + S_base + 0, mask=mask_2d, other=0.0)
@@ -131,12 +130,11 @@ def ssm_step_kernel(
         B3 = tl.load(B_ptr + B_base + 3, mask=mask_full, other=0.0)
 
         # Compute B * S (input injection)
-        # Explicitly broadcast S to the full (B, D, K) tile shape to avoid
-        # Triton rank-mismatch errors when BLOCK_K differs from 1.
-        s0 = tl.broadcast_to(S0[:, :, None], B0.shape)
-        s1 = tl.broadcast_to(S1[:, :, None], B1.shape)
-        s2 = tl.broadcast_to(S2[:, :, None], B2.shape)
-        s3 = tl.broadcast_to(S3[:, :, None], B3.shape)
+        # Broadcast S across k dimension explicitly to match (B, D, K)
+        s0 = tl.broadcast_to(S0[:, :, None], mask_full.shape)
+        s1 = tl.broadcast_to(S1[:, :, None], mask_full.shape)
+        s2 = tl.broadcast_to(S2[:, :, None], mask_full.shape)
+        s3 = tl.broadcast_to(S3[:, :, None], mask_full.shape)
 
         BS0 = B0*s0 - B1*s1 - B2*s2 - B3*s3
         BS1 = B0*s1 + B1*s0 + B2*s3 - B3*s2
