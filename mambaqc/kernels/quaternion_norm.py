@@ -206,7 +206,10 @@ class QuaternionLayerNorm(torch.nn.Module):
         Returns:
             out: [batch, seq_len, d_model, 4]
         """
-        return quaternion_layer_norm_fused(q, self.gamma, self.beta, self.eps)
+        if q.is_cuda and torch.cuda.is_available():
+            return quaternion_layer_norm_fused(q, self.gamma, self.beta, self.eps)
+
+        return quaternion_layer_norm_reference(q, self.gamma, self.beta, self.eps)
 
     def extra_repr(self) -> str:
         return f"d_model={self.d_model}, eps={self.eps}"
