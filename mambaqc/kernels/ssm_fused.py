@@ -126,16 +126,18 @@ def ssm_step_kernel(
         B3 = tl.load(B_ptr + B_base + 3, mask=mask_full, other=0.0)
 
         # Compute B * S (input injection)
-        # Broadcast S across k dimension
-        S0_bcast = S0[:, :, None]
-        S1_bcast = S1[:, :, None]
-        S2_bcast = S2[:, :, None]
-        S3_bcast = S3[:, :, None]
+        # Broadcast S across k dimension explicitly
+        # S is [BLOCK_B, BLOCK_D], need to expand to [BLOCK_B, BLOCK_D, BLOCK_K]
+        # We multiply element-wise, letting Triton auto-broadcast the k dimension
+        S0_expanded = tl.broadcast_to(S0[:, :, None], (BLOCK_B, BLOCK_D, BLOCK_K))
+        S1_expanded = tl.broadcast_to(S1[:, :, None], (BLOCK_B, BLOCK_D, BLOCK_K))
+        S2_expanded = tl.broadcast_to(S2[:, :, None], (BLOCK_B, BLOCK_D, BLOCK_K))
+        S3_expanded = tl.broadcast_to(S3[:, :, None], (BLOCK_B, BLOCK_D, BLOCK_K))
 
-        BS0 = B0*S0_bcast - B1*S1_bcast - B2*S2_bcast - B3*S3_bcast
-        BS1 = B0*S1_bcast + B1*S0_bcast + B2*S3_bcast - B3*S2_bcast
-        BS2 = B0*S2_bcast - B1*S3_bcast + B2*S0_bcast + B3*S1_bcast
-        BS3 = B0*S3_bcast + B1*S2_bcast - B2*S1_bcast + B3*S0_bcast
+        BS0 = B0*S0_expanded - B1*S1_expanded - B2*S2_expanded - B3*S3_expanded
+        BS1 = B0*S1_expanded + B1*S0_expanded + B2*S3_expanded - B3*S2_expanded
+        BS2 = B0*S2_expanded - B1*S3_expanded + B2*S0_expanded + B3*S1_expanded
+        BS3 = B0*S3_expanded + B1*S2_expanded - B2*S1_expanded + B3*S0_expanded
 
         # Update state: h_new = q*h_prev + B*S
         hn0 = qh0 + BS0
