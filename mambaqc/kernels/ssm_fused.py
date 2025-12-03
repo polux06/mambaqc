@@ -308,7 +308,11 @@ def ssm_step_fused(
     stride_yb, stride_yd, _ = y.stride()
 
     # Tiling
-    BLOCK_B, BLOCK_D, BLOCK_K = 1, 16, d_state
+    # Keep BLOCK_K small to avoid Triton broadcast shape rank mismatches when
+    # expanding the 2D S inputs across the state dimension. A value of 1 keeps
+    # each step's tile shape consistent with the 2D S loads while still letting
+    # the loop cover all k positions.
+    BLOCK_B, BLOCK_D, BLOCK_K = 1, 16, 1
 
     # Grid: one block per (batch, d_model) position
     grid = (batch_size, triton.cdiv(d_model, BLOCK_D))
