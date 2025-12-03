@@ -24,6 +24,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .quaternion_ops import _can_use_triton
+
 
 @triton.jit
 def ssm_step_kernel(
@@ -84,7 +86,10 @@ def ssm_step_kernel(
     y3_acc = tl.zeros((BLOCK_B, BLOCK_D), dtype=tl.float32)
 
     # Load S (selected signal) - shared across all k
-    S_base = b_idx[:, :, 0] * stride_Sb + d_idx[:, :, 0] * stride_Sd
+    b_idx_2d = b_offsets[:, None]
+    d_idx_2d = d_offsets[None, :]
+    # Keep S indexing 2D so the loaded tensors are rank-2 and expand to K cleanly
+    S_base = b_idx_2d * stride_Sb + d_idx_2d * stride_Sd
     mask_2d = b_mask[:, None] & d_mask[None, :]
 
     S0 = tl.load(S_ptr + S_base + 0, mask=mask_2d, other=0.0)
@@ -126,16 +131,17 @@ def ssm_step_kernel(
         B3 = tl.load(B_ptr + B_base + 3, mask=mask_full, other=0.0)
 
         # Compute B * S (input injection)
-        # Broadcast S across k dimension
-        S0_bcast = S0[:, :, None]
-        S1_bcast = S1[:, :, None]
-        S2_bcast = S2[:, :, None]
-        S3_bcast = S3[:, :, None]
+        # Explicitly broadcast S to the full (B, D, K) tile shape to avoid
+        # Triton rank-mismatch errors when BLOCK_K differs from 1.
+        s0 = tl.broadcast_to(S0[:, :, None], B0.shape)
+        s1 = tl.broadcast_to(S1[:, :, None], B1.shape)
+        s2 = tl.broadcast_to(S2[:, :, None], B2.shape)
+        s3 = tl.broadcast_to(S3[:, :, None], B3.shape)
 
-        BS0 = B0*S0_bcast - B1*S1_bcast - B2*S2_bcast - B3*S3_bcast
-        BS1 = B0*S1_bcast + B1*S0_bcast + B2*S3_bcast - B3*S2_bcast
-        BS2 = B0*S2_bcast - B1*S3_bcast + B2*S0_bcast + B3*S1_bcast
-        BS3 = B0*S3_bcast + B1*S2_bcast - B2*S1_bcast + B3*S0_bcast
+        BS0 = B0*s0 - B1*s1 - B2*s2 - B3*s3
+        BS1 = B0*s1 + B1*s0 + B2*s3 - B3*s2
+        BS2 = B0*s2 - B1*s3 + B2*s0 + B3*s1
+        BS3 = B0*s3 + B1*s2 - B2*s1 + B3*s0
 
         # Update state: h_new = q*h_prev + B*S
         hn0 = qh0 + BS0
@@ -170,7 +176,7 @@ def ssm_step_kernel(
         y3_acc += tl.sum(Ch3, axis=2)
 
     # Add skip connection: y += D * S
-    D_base = b_idx[:, :, 0] * stride_Db + d_idx[:, :, 0]
+    D_base = b_idx_2d * stride_Db + d_idx_2d
     D_val = tl.load(D_ptr + D_base, mask=mask_2d, other=0.0)
 
     y0_acc += D_val * S0
@@ -179,7 +185,7 @@ def ssm_step_kernel(
     y3_acc += D_val * S3
 
     # Store output y[b, d, :]
-    y_base = b_idx[:, :, 0] * stride_yb + d_idx[:, :, 0] * stride_yd
+    y_base = b_idx_2d * stride_yb + d_idx_2d * stride_yd
     tl.store(y_ptr + y_base + 0, y0_acc, mask=mask_2d)
     tl.store(y_ptr + y_base + 1, y1_acc, mask=mask_2d)
     tl.store(y_ptr + y_base + 2, y2_acc, mask=mask_2d)
@@ -278,6 +284,9 @@ def ssm_step_fused(
         h_new = q * h_prev + B * S
         y = sum_k(C[:, :, k] * h_new[:, :, k]) + D * S
     """
+    if not _can_use_triton(q):
+        return ssm_step_reference(q, B, S, C, D, h_prev)
+
     batch_size, d_model, d_state, _ = q.shape
 
     assert B.shape == (batch_size, d_model, d_state, 4)
@@ -349,6 +358,24 @@ def ssm_forward_fused(
     Note: This loops over timesteps in Python. For maximum efficiency,
     could implement a mega-kernel, but that's complex and less flexible.
     """
+    if not _can_use_triton(q):
+        batch_size, seq_len, d_model, d_state, _ = q.shape
+        h = torch.zeros(batch_size, d_model, d_state, 4, device=q.device, dtype=q.dtype)
+        y_all = torch.empty(batch_size, seq_len, d_model, 4, device=q.device, dtype=q.dtype)
+
+        for t in range(seq_len):
+            h, y_t = ssm_step_reference(
+                q[:, t],
+                B[:, t],
+                S[:, t],
+                C[:, t],
+                D[:, t],
+                h,
+            )
+            y_all[:, t] = y_t
+
+        return y_all
+
     batch_size, seq_len, d_model, d_state, _ = q.shape
 
     # Initialize state
